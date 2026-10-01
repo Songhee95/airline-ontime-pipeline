@@ -1,0 +1,6 @@
+services:
+  app:
+    build: .
+    image: airline-env:0.3
+    volumes:
+      - ./data:/app/data
