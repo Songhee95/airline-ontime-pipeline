@@ -4,3 +4,13 @@ services:
     image: airline-env:0.3
     volumes:
       - ./data:/app/data
+
+  db: 
+    image: postgres:16
+    environment: 
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: 
+      - pgdata:/var/lib/postgresql/data
+
+volumes: 
+  pgdata:
