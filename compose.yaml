@@ -6,8 +6,10 @@ x-airflow-common:
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
-  image: apache/airflow:3.3.2
-  # build: .
+  build:
+    context: ./
+    dockerfile: airflow.Dockerfile
+  image: airline-airflow:0.1
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -31,6 +33,7 @@ x-airflow-common:
     - ./logs:/opt/airflow/logs
     - ./config:/opt/airflow/config
     - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
   user: "${AIRFLOW_UID:?set AIRFLOW_UID in .env}:0"
   depends_on:
     &airflow-common-depends-on
