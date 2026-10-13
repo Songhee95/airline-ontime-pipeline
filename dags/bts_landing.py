@@ -37,7 +37,7 @@ def bts_landing():
         with urllib.request.urlopen(url) as resp, open(tmp_zip, "wb") as f: # BTS 에 접속해서 response 를 받음 (404면 여기서 바로 에러) & 작업 공간에 파일을 쓰기(w) + 바이너리(b) 모드로 엶
             shutil.copyfileobj(resp,f) #응답을 조금씩 읽어서 파일에 씀
 
-        # 파일 download 중도 fail 방지
+        # 파일 download atomic (다운로드가 끝까지 성공 해야만 최종 폴더가 생김)
         if not zipfile.is_zipfile(tmp_zip):
             raise ValueError(f"Downloaded file is not a valid zip: {url}")
         
