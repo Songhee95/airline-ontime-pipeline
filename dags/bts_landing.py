@@ -14,13 +14,14 @@ BTS_URL = (
     "On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
 )
 LANDING_ROOT = Path("/opt/airflow/data/landing/")  
+BRONZE_ROOT = Path("/opt/airflow/data/bronze/")
 
 
 @dag(schedule=None, catchup=False)
 def bts_landing():
 
     @task
-    def download_bts(year: int = 2025, month: int = 1) -> str:
+    def download_bts(year: int = 2025, month: int = 1) -> dict:
         ingested_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  
 
         month_dir = LANDING_ROOT / 'bts' / f"year={year}" / f"month={month:02d}"
@@ -54,11 +55,59 @@ def bts_landing():
 
         # rename and return
         os.rename(tmp_dir, final_dir)
-        return str(final_dir / zip_name)
+        
+        return {
+            "zip_path": str(final_dir / zip_name),
+            'year': year,
+            'month':month, 
+            'ingested_at': ingested_at,
+            'sha256': manifest['sha256']
+        }
 
+    @task
+    def to_bronze(info: dict) -> str:
+        import duckdb
+        import tempfile
+        # 입력 정보 꺼내기
+        zip_path=Path(info['zip_path']) 
 
+        # 출력 위치 정하기
+        # p_year / p_month: duckdb가 자동으로 폴더 라벨 컬럼 생성. 이미 year 과 month 가 있는 컬럼이라서 risky.
+        # 폴더 라벨 컬럼 타입은 duckdb 에 의해 추측된 타입.
+        bronze_dir = BRONZE_ROOT / 'bts' / f"p_year={info['year']}" / f"p_month={info['month']:02d}" # bronze/bts/p_year=2025/p_month=01
+        bronze_dir.mkdir(parents=True, exist_ok=True)
+        final = bronze_dir / "data.parquet"
+        tmp = bronze_dir / "data.parquet.tmp" # same folder as final
 
-    download_bts()
+        # zip 안의 csv 확인 + 임시로 풀기 
+        with zipfile.ZipFile(zip_path) as zf: # open zip file
+            csvs = [n for n in zf.namelist() if n.lower().endswith(".csv")] # get all the files in the zip folder & get only files with .csv.
+            if len(csvs) != 1:
+                raise ValueError(f"Expected exactly 1 CSV in {zip_path}, found: {csvs}")
+
+            with tempfile.TemporaryDirectory() as work: # 빈폴더를 만드는데 이름은 겹치지 않게 무작위
+                csv_path = zf.extract(csvs[0], work) #zip 안에서 csv 하나만 꺼내서 work 폴더에 품
+
+                # Parquet 쓰기 + 검증
+                src = f"read_csv('{csv_path}', all_varchar=true)"
+                n_csv = duckdb.sql(f"SELECT count(*) FROM {src}").fetchone()[0]
+                duckdb.sql(f"""
+                    COPY (
+                        SELECT *,'{info['ingested_at']}' AS _landing_ingested_at, 
+                                '{info["sha256"]}' AS _landing_sha256
+                        FROM {src}
+                    ) TO '{tmp}' (FORMAT parquet)
+                """)
+                n_pq = duckdb.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
+                if n_pq != n_csv:
+                    raise ValueError(f"Row count mismatch: csv={n_csv}, parquet={n_pq}")
+
+        os.replace(tmp, final)
+        return str(final)
+        
+
+    
+    to_bronze(download_bts())
 
 
 bts_landing()
