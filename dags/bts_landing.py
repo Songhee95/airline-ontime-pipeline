@@ -90,17 +90,19 @@ def bts_landing():
 
                 # Parquet 쓰기 + 검증
                 src = f"read_csv('{csv_path}', all_varchar=true)"
-                n_csv = duckdb.sql(f"SELECT count(*) FROM {src}").fetchone()[0]
-                duckdb.sql(f"""
-                    COPY (
-                        SELECT *,'{info['ingested_at']}' AS _landing_ingested_at, 
-                                '{info["sha256"]}' AS _landing_sha256
-                        FROM {src}
-                    ) TO '{tmp}' (FORMAT parquet)
-                """)
-                n_pq = duckdb.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
-                if n_pq != n_csv:
-                    raise ValueError(f"Row count mismatch: csv={n_csv}, parquet={n_pq}")
+                with duckdb.connect(config={"memory_limit":"1GB"}) as con: 
+                    print("duckdb memory_limit =", con.sql("SELECT current_setting('memory_limit')").fetchone()[0])
+                    n_csv = con.sql(f"SELECT count(*) FROM {src}").fetchone()[0]
+                    con.sql(f"""
+                        COPY (
+                            SELECT *,'{info['ingested_at']}' AS _landing_ingested_at, 
+                                    '{info["sha256"]}' AS _landing_sha256
+                            FROM {src}
+                        ) TO '{tmp}' (FORMAT parquet)
+                    """)
+                    n_pq = con.sql(f"SELECT count(*) FROM read_parquet('{tmp}')").fetchone()[0]
+                    if n_pq != n_csv:
+                        raise ValueError(f"Row count mismatch: csv={n_csv}, parquet={n_pq}")
 
         os.replace(tmp, final)
         return str(final)
