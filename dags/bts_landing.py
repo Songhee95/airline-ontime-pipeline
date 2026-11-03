@@ -18,6 +18,8 @@ LANDING_ROOT = Path("/opt/airflow/data/landing/")
 BRONZE_ROOT = Path("/opt/airflow/data/bronze/")
 START_MONTH = (2025, 1) # Landing 이 비어있을때 시작할 달
 MAX_MONTHS_PER_RUN = 3 # 한 run 에 최대 몇달까지 받을수 잇나
+LOOKBACK_MONTHS = 3
+CHECK_LOG = LANDING_ROOT / 'bts' / '_check_log.jsonl' # 확인 기록 파일
 
 # Find the watermark (lowerbound from manifest.json)
 def find_watermark(landing_root:Path) -> tuple[int,int] | None: 
@@ -39,8 +41,13 @@ def next_month(ym: tuple[int, int]) -> tuple[int, int]:
         return (year + 1, 1)
     return (year, month + 1)
 
-def download_month(year:int, month:int) -> dict | None: 
-    """Download one BTS month into Landing. Return None if BTS has not published it yet (404)"""
+def download_month(year:int, month:int, compare_sha: str | None = None) -> dict | None: 
+    """
+    Download one BTS month into Landing.
+    - None: BTS  has not published it (404)
+    - {"changed" : False}: same sha256 as compare_sha -> the new download is deleted
+    - {"changed": True}: saved as a new Landing version
+    """
     ingested_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     month_dir = LANDING_ROOT / 'bts' / f"year={year}" / f"month={month:02d}"
     final_dir = month_dir / f"ingested_at={ingested_at}"
@@ -68,11 +75,20 @@ def download_month(year:int, month:int) -> dict | None:
     if not zipfile.is_zipfile(tmp_zip): 
         raise ValueError(f"Downloaded file is not a valid zip: {url}")
     
+    # sha256을 먼저 계산 (같으면 저장 x)
+    sha = hashlib.sha256(tmp_zip.read_bytes()).hexdigest()
+
+    # lookback: 이미 있는 버전과 지문이 같으면 -> 새 정보 없음 -> _tmp_ 삭제
+    if compare_sha is not None and sha == compare_sha: 
+        shutil.rmtree(tmp_dir) # _tmp_ 폴더 통째로 삭제
+        return {"year": year, "month": month, "changed": False, "sha256": sha}
+
+
     # Lineage json file creation
     manifest = {
         "source_url": url, 
         "ingested_at": ingested_at, 
-        "sha256": hashlib.sha256(tmp_zip.read_bytes()).hexdigest(), # 지문계산(바이트의 전부).64글자로
+        "sha256": sha, # 지문계산(바이트의 전부).64글자로
         "bytes": tmp_zip.stat().st_size, #파일정보().크기
         "dag_run_id": get_current_context()["run_id"],
         "code_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), # 지문계산(이 DAG 파일 자신의 경로).64글자로
@@ -86,7 +102,8 @@ def download_month(year:int, month:int) -> dict | None:
         'year': year,
         'month':month, 
         'ingested_at': ingested_at,
-        'sha256': manifest['sha256']
+        'sha256': manifest['sha256'], 
+        'changed': True, 
     }
 
 # landing 은 완료 했는데 bronze 로 가는 과정에서 fail 이 난경우, manifest 데이터랑 bronze 파일을 비교해서 
@@ -129,6 +146,27 @@ def bronze_source(year: int, month:int) -> str | None:
 @dag(schedule=None, catchup=False)
 def bts_landing():
     @task
+    def check_recent_months() -> list[dict]:
+        """Re-download the latest LOOKBACK_MONTHS months and keep a new version only if BTS changed the file."""
+        latest = latest_versions(LANDING_ROOT)
+        recent = sorted(latest)[-LOOKBACK_MONTHS:] # 데이터 달 기준 최근 3달
+        results = []
+        for (year,month) in recent: 
+            manifest = json.loads((latest[(year, month)] / "_manifest.json").read_text())
+            result = download_month(year, month, compare_sha=manifest['sha256'])
+            if result is None: 
+                raise ValueError(f"{year}-{month:02d} was downloaded before, but BTS now returns 404")
+            results.append(result)
+            with open(CHECK_LOG, 'a') as f: 
+                f.write(json.dumps({
+                    'check_at': datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ'),
+                    'year': year, 'month': month, 
+                    'changed': result['changed'], 'sha256': result['sha256'],
+                }) + "\n")
+        return results
+
+
+    @task
     def download_new_months() -> list[dict]:
         wm = find_watermark(LANDING_ROOT)
         ym = START_MONTH if wm is None else next_month(wm)
@@ -141,7 +179,7 @@ def bts_landing():
             ym=next_month(ym)
         return results
 
-    @task
+    @task(trigger_rule = 'all_done') # 앞 task 가 실패해도 Bronze 수리는 실행
     def plan_bronze() -> list[dict]: 
         """
         Months whose Bronze is missing or built from an older Landing version (reconcile)
@@ -208,7 +246,7 @@ def bts_landing():
         
 
     plan = plan_bronze()
-    download_new_months() >> plan    # 순서만: Landing을 다 받은 다음에 계획 세우기
+    check_recent_months() >> download_new_months() >> plan    # 뒤를 보고(lookback) → 앞을 보고(새 달) → Bronze 맞추기
     to_bronze.expand(info=plan)       # 계획에 있는 달마다 to_bronze 하나씩
 
 
