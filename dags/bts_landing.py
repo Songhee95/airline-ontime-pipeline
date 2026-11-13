@@ -8,7 +8,7 @@ import os # os.rename 이름 바꾸기
 import zipfile # zip 인지 아닌지 검사
 import urllib.error # 404 구분용 HTTPError
 
-from airflow.sdk import dag, task, get_current_context
+from airflow.sdk import dag, task, get_current_context, Param
 
 BTS_URL = (
     "https://transtats.bts.gov/PREZIP/"
@@ -20,6 +20,7 @@ START_MONTH = (2025, 1) # Landing 이 비어있을때 시작할 달
 MAX_MONTHS_PER_RUN = 3 # 한 run 에 최대 몇달까지 받을수 잇나
 LOOKBACK_MONTHS = 3
 CHECK_LOG = LANDING_ROOT / 'bts' / '_check_log.jsonl' # 확인 기록 파일
+MAX_RECHECK_MONTHS = 6 # 사람이 넣은 메모 목록 최대
 
 # Find the watermark (lowerbound from manifest.json)
 def find_watermark(landing_root:Path) -> tuple[int,int] | None: 
@@ -143,15 +144,37 @@ def bronze_source(year: int, month:int) -> str | None:
 
 
 
-@dag(schedule=None, catchup=False)
+@dag(schedule=None, catchup=False, params={
+    "recheck_months": Param(
+        [], # 기본값: 빈 리스트 = 최근 3달만  
+        type="array", 
+        items={"type":"string"}, 
+        description="Old months to re-check against BTS, one per line, e.g. 2025-03",
+    )
+})
 def bts_landing():
     @task
     def check_recent_months() -> list[dict]:
-        """Re-download the latest LOOKBACK_MONTHS months and keep a new version only if BTS changed the file."""
+        """Re-check the latest LOOKBACK_MONTHS months plus any months in the recheck_months param; keep a new version only if BTS changed the file."""
         latest = latest_versions(LANDING_ROOT)
         recent = sorted(latest)[-LOOKBACK_MONTHS:] # 데이터 달 기준 최근 3달
+        
+        ######### Trigger 메모로 넘어온 달들 (사람이 넣는 메모 체크) ############
+        raw = get_current_context()["params"]["recheck_months"] or []
+        if len(raw) > MAX_RECHECK_MONTHS:
+            raise ValueError(f"recheck_months allows at most {MAX_RECHECK_MONTHS}, got {len(raw)}")
+        extra = []
+        for s in raw: 
+            d = datetime.strptime(s, "%Y-%m")  #날짜 형식 틀리면 여기서 바로 fail fast
+            ym = (d.year, d.month)
+            if ym not in latest: 
+                raise ValueError(f"{s} was never downloaded, so there is nothing to re-check")
+            extra.append(ym)
+        targets = sorted(set(recent) | set(extra)) # 합치기 + 중복 제거 + 순서정렬
+        ###################################################################
+
         results = []
-        for (year,month) in recent: 
+        for (year,month) in targets: 
             manifest = json.loads((latest[(year, month)] / "_manifest.json").read_text())
             result = download_month(year, month, compare_sha=manifest['sha256'])
             if result is None: 
